@@ -22,11 +22,27 @@ if ! dpkg-query -W -f='${Status}' php5.6-fpm 2>/dev/null | grep -q 'install ok i
   apt-get update
   apt-cache show php5.6-fpm >/dev/null 2>&1 || { echo 'PHP 5.6 package unavailable for this release/architecture'; exit 1; }
 fi
-apt-get install -y php5.6-fpm php5.6-cli
+apt-get install -y php5.6-fpm php5.6-cli php5.6-sqlite3 sqlite3
 systemctl enable --now ssh php5.6-fpm
 systemctl start ssh
 install -d -m 755 "$BASE" "$BASE/web" "$BASE/tls" "$BASE/ftp"
 cd "$BASE"
+if [[ -f web/index.php ]]; then backup=$(mktemp -d /opt/ngfw-portal-backup.XXXXXX); chmod 700 "$backup"; cp -a web "$backup/"; echo "Backup web: $backup"; fi
+install -d -o www-data -g www-data -m 0750 "$BASE/database"
+if [[ ! -f database/portal.db ]]; then
+sqlite3 database/portal.db <<'SQL'
+CREATE TABLE users(id INTEGER PRIMARY KEY, username TEXT UNIQUE, password_hash TEXT, role TEXT);
+CREATE TABLE training_credentials(username TEXT, password TEXT, role TEXT);
+INSERT INTO training_credentials VALUES ('admin_demo','LAB-Admin-2026','Administrator'),('pegawai_demo','LAB-Staff-2026','Staff'),('operator_demo','LAB-Operator-2026','Operator');
+CREATE TABLE documents(id INTEGER PRIMARY KEY, title TEXT, description TEXT);
+INSERT INTO documents VALUES (1,'Administrasi publik','Panduan layanan administrasi'),(2,'Dokumen kementerian','Informasi layanan publik');
+CREATE TABLE complaints(id INTEGER PRIMARY KEY, name TEXT, message TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE uploads(id INTEGER PRIMARY KEY, filename TEXT, size INTEGER, sha256 TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+SQL
+php5.6 -r '$d=new PDO("sqlite:/opt/ngfw-portal/database/portal.db"); $q=$d->prepare("INSERT INTO users(username,password_hash,role) VALUES(?,?,?)"); $q->execute(array("pegawai",password_hash("Latihan2026!",PASSWORD_DEFAULT),"Staff"));'
+fi
+chown www-data:www-data database/portal.db
+chmod 640 database/portal.db
 cat > /etc/php/5.6/fpm/pool.d/ngfw-portal.conf <<'POOL'
 [ngfw-portal]
 user = www-data
@@ -43,12 +59,15 @@ php_admin_flag[display_errors] = off
 php_admin_flag[expose_php] = off
 php_admin_value[disable_functions] = exec,passthru,shell_exec,system,proc_open,popen
 POOL
+php5.6 -r 'if (!extension_loaded("pdo_sqlite")) exit(1);'
 php-fpm5.6 -t
 systemctl restart php5.6-fpm
 cat > nginx.conf <<'NGINX'
 server {
     listen LAB_BIND_IP:80;
+    listen 127.0.0.1:80;
     listen LAB_BIND_IP:443 ssl;
+    listen 127.0.0.1:443 ssl;
     server_name portal.kementrian.co.id;
     ssl_certificate /opt/ngfw-portal/tls/cert.pem;
     ssl_certificate_key /opt/ngfw-portal/tls/key.pem;
@@ -77,6 +96,10 @@ cat > web/index.php <<'PHP'
 <?php
 function h($s){return htmlspecialchars($s, ENT_QUOTES, 'UTF-8');}
 function field($k,$method='GET'){ $a=$method==='POST'?$_POST:$_GET; return isset($a[$k])&&is_string($a[$k])?$a[$k]:''; }
+$db=new PDO('sqlite:/opt/ngfw-portal/database/portal.db');
+$db->setAttribute(PDO::ATTR_ERRMODE,PDO::ERRMODE_EXCEPTION);
+$db->exec('PRAGMA busy_timeout=3000');
+header('Cache-Control: no-store');
 $p=basename($_SERVER['SCRIPT_NAME']);
 $menus=array('index.php'=>'Beranda','layanan.php'=>'Layanan','login.php'=>'Login Pegawai','search.php'=>'Pencarian','pengaduan.php'=>'Pengaduan','upload.php'=>'Unggah Dokumen','download.php'=>'Unduh Dokumen');
 if($p==='download.php' && field('file')==='eicar'){
@@ -85,13 +108,19 @@ if($p==='download.php' && field('file')==='eicar'){
 }
 if($p==='download.php' && field('file')==='normal'){header('Content-Type: text/plain');header('Content-Disposition: attachment; filename="panduan.txt"');echo "Dokumen dummy portal layanan kementerian.\n";exit;}
 ?><!doctype html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Portal Layanan Kementerian | Lab</title><style>
-*{box-sizing:border-box}body{margin:0;font:16px Arial,sans-serif;background:#f1f5f9;color:#172a42}header{background:#102d50;color:white;padding:24px max(5%,calc((100% - 1100px)/2));}header small{color:#b9d4f5;letter-spacing:2px}nav{background:#fff;padding:16px 5%;display:flex;gap:18px;flex-wrap:wrap;border-bottom:1px solid #dbe4ee}nav a{color:#153e69;text-decoration:none;font-size:14px;font-weight:bold}main{max-width:1100px;margin:32px auto;padding:0 20px}.hero{background:#174a78;color:white;padding:35px;border-radius:12px}.panel{background:white;padding:28px;border:1px solid #dbe4ee;border-radius:10px;margin:20px 0}.tiles{display:flex;flex-wrap:wrap;gap:15px}.tiles a{flex:1;min-width:200px;padding:22px;background:white;border:1px solid #dbe4ee;border-radius:8px;color:#174a78;text-decoration:none}input,textarea{display:block;width:100%;max-width:540px;padding:12px;margin:9px 0 17px;border:1px solid #aebdcd;border-radius:5px}button,.btn{display:inline-block;background:#174a78;color:white;padding:12px 20px;border:0;border-radius:5px;text-decoration:none;cursor:pointer}.notice{background:#e8f2fc;padding:15px;overflow-wrap:anywhere}footer{padding:24px;text-align:center;color:#52657c;font-size:13px}h1{margin:10px 0}</style></head><body><header><small>SIMULASI LABORATORIUM • BUKAN SITUS RESMI</small><h1>Portal Layanan Kementerian</h1><div>Pusat informasi dan layanan administrasi digital</div></header><nav><?php foreach($menus as $url=>$label){echo '<a href="/'.$url.'">'.h($label).'</a>';} ?></nav><main>
+*{box-sizing:border-box}body{margin:0;font:16px Arial,sans-serif;background:#f1f5f9;color:#172a42}header{background:#102d50;color:white;padding:24px max(5%,calc((100% - 1100px)/2));}header small{color:#b9d4f5;letter-spacing:2px}nav{background:#fff;padding:16px 5%;display:flex;gap:18px;flex-wrap:wrap;border-bottom:1px solid #dbe4ee}nav a{color:#153e69;text-decoration:none;font-size:14px;font-weight:bold}main{max-width:1100px;margin:32px auto;padding:0 20px}.hero{background:#174a78;color:white;padding:35px;border-radius:12px}.panel{background:white;padding:28px;border:1px solid #dbe4ee;border-radius:10px;margin:20px 0}.tiles{display:flex;flex-wrap:wrap;gap:15px}.tiles a{flex:1;min-width:200px;padding:22px;background:white;border:1px solid #dbe4ee;border-radius:8px;color:#174a78;text-decoration:none}input,textarea{display:block;width:100%;max-width:540px;padding:12px;margin:9px 0 17px;border:1px solid #aebdcd;border-radius:5px}button,.btn{display:inline-block;background:#174a78;color:white;padding:12px 20px;border:0;border-radius:5px;text-decoration:none;cursor:pointer}.notice{background:#e8f2fc;padding:15px;overflow-wrap:anywhere}footer{padding:24px;text-align:center;color:#52657c;font-size:13px}h1{margin:10px 0}table{border-collapse:collapse;width:100%;background:white}td,th{padding:12px;border:1px solid #dbe4ee;text-align:left}</style></head><body><header><small>SIMULASI LABORATORIUM • BUKAN SITUS RESMI</small><h1>Portal Layanan Kementerian</h1><div>Pusat informasi dan layanan administrasi digital</div></header><nav><?php foreach($menus as $url=>$label){echo '<a href="/'.$url.'">'.h($label).'</a>';} ?></nav><main>
 <?php if($p==='index.php'){ ?><section class="hero"><h1>Layanan publik dalam satu portal</h1><p>Akses informasi, dokumen, dan layanan administrasi secara digital.</p></section><h2>Layanan utama</h2><div class="tiles"><?php foreach($menus as $url=>$label){if($url!== 'index.php')echo '<a href="/'.$url.'"><strong>'.h($label).'</strong><p>Akses layanan &rsaquo;</p></a>';} ?></div>
 <?php }else{ ?><section class="panel"><h2><?php echo h(isset($menus[$p])?$menus[$p]:'Layanan'); ?></h2>
-<?php if($p==='login.php'){ ?><form method="post"><label>Username<input name="username" required></label><label>Password<input name="password" type="password" required></label><button>Masuk</button></form><?php if($_SERVER['REQUEST_METHOD']==='POST')echo '<p class="notice">Simulasi login: kredensial tidak diverifikasi dan tidak disimpan.</p>'; ?>
-<?php }elseif($p==='search.php'){ ?><form><label>Kata kunci<input name="q" value="<?php echo h(field('q')); ?>"></label><button>Cari</button></form><?php if(isset($_GET['q']))echo '<p class="notice">Hasil pencarian untuk: '.h(field('q')).' — Tidak ada dokumen yang cocok.</p>'; ?>
-<?php }elseif($p==='pengaduan.php'){ ?><form method="post"><label>Nama<input name="nama" required></label><label>Pesan<textarea name="pesan" required></textarea></label><button>Kirim</button></form><?php if($_SERVER['REQUEST_METHOD']==='POST')echo '<p class="notice">Pengaduan dummy diterima; data tidak disimpan.</p>'; ?>
-<?php }elseif($p==='upload.php'){ ?><form method="post" enctype="multipart/form-data"><label>Dokumen (maks. 1 MiB)<input type="file" name="file" required></label><button>Unggah</button></form><?php if(isset($_FILES['file'])){ $f=$_FILES['file'];if($f['error']===UPLOAD_ERR_OK && $f['size']<=1048576 && is_uploaded_file($f['tmp_name'])){echo '<p class="notice">Transfer diterima: '.h(basename($f['name'])).' ('.(int)$f['size'].' byte). File tidak disimpan atau dieksekusi.</p>';}else{http_response_code(400);echo '<p>Unggahan ditolak atau terlalu besar.</p>';}} ?>
+<?php if($p==='login.php'){ ?><form method="post"><label>Username<input name="username" required></label><label>Password<input name="password" type="password" required></label><button>Masuk</button></form><?php if($_SERVER['REQUEST_METHOD']==='POST'){
+$u=field('username','POST'); $pw=field('password','POST');
+if($u==="' OR '1'='1"){
+ echo '<div class="notice"><strong>Simulasi SQL Injection: authentication bypass</strong><p>Dashboard Administrator — kredensial fiktif khusus latihan, bukan akun login aktif.</p><table><tr><th>Username</th><th>Password latihan</th><th>Role</th></tr>';
+ foreach($db->query('SELECT username,password,role FROM training_credentials') as $r){echo '<tr><td>'.h($r['username']).'</td><td>'.h($r['password']).'</td><td>'.h($r['role']).'</td></tr>';} echo '</table></div>';
+}else{$q=$db->prepare('SELECT * FROM users WHERE username=?');$q->execute(array($u));$r=$q->fetch(PDO::FETCH_ASSOC);if($r && password_verify($pw,$r['password_hash']))echo '<p class="notice">Login berhasil: '.h($r['username']).' — '.h($r['role']).'</p>';else echo '<p class="notice">Username atau password salah.</p>';}}
+ ?>
+<?php }elseif($p==='search.php'){ ?><form><label>Kata kunci<input name="q" value="<?php echo h(field('q')); ?>"></label><button>Cari</button></form><?php if(isset($_GET['q'])){ $term=field('q'); echo '<p class="notice">Hasil pencarian untuk: '.h($term).'</p>'; $q=$db->prepare('SELECT title,description FROM documents WHERE title LIKE ? OR description LIKE ?');$q->execute(array('%'.$term.'%','%'.$term.'%'));foreach($q as $r){echo '<p><strong>'.h($r['title']).'</strong> — '.h($r['description']).'</p>';} if($term==='<script>alert("CTF")</script>' || $term==='<script>alert("XSS Detected")</script>'){echo '<p class="notice">Demonstrasi reflected XSS: dialog JavaScript terkontrol.</p><script>alert("XSS Detected");</script>';}} ?>
+<?php }elseif($p==='pengaduan.php'){ ?><form method="post"><label>Nama<input name="nama" required></label><label>Pesan<textarea name="pesan" required></textarea></label><button>Kirim</button></form><?php if($_SERVER['REQUEST_METHOD']==='POST'){ $q=$db->prepare('INSERT INTO complaints(name,message) VALUES(?,?)');$q->execute(array(substr(field('nama','POST'),0,200),substr(field('pesan','POST'),0,4000)));echo '<p class="notice">Pengaduan diterima. Nomor tiket: '.h($db->lastInsertId()).'</p>'; } ?>
+<?php }elseif($p==='upload.php'){ ?><form method="post" enctype="multipart/form-data"><label>Dokumen (maks. 1 MiB)<input type="file" name="file" required></label><button>Unggah</button></form><?php if(isset($_FILES['file'])){ $f=$_FILES['file'];if($f['error']===UPLOAD_ERR_OK && $f['size']<=1048576 && is_uploaded_file($f['tmp_name'])){$name=basename($f['name']);$hash=hash_file('sha256',$f['tmp_name']);$q=$db->prepare('INSERT INTO uploads(filename,size,sha256) VALUES(?,?,?)');$q->execute(array($name,(int)$f['size'],$hash));echo '<div class="notice"><strong>Upload berhasil — file diterima server</strong><p>Nama: '.h($name).'</p><p>Ukuran: '.(int)$f['size'].' byte</p><p>SHA-256: '.h($hash).'</p><p>Nomor transfer: '.h($db->lastInsertId()).'</p><p>Waktu: '.h(gmdate('Y-m-d H:i:s')).' UTC</p><p>Metadata tersimpan; isi file sementara tidak disimpan permanen atau dieksekusi.</p></div>';}else{http_response_code(400);echo '<p>Unggahan ditolak atau terlalu besar.</p>';}} ?>
 <?php }elseif($p==='download.php'){ ?><p>Dokumen biasa dan file standar uji antivirus (EICAR, bukan malware aktif).</p><p><a class="btn" href="?file=normal">Unduh dokumen biasa</a></p><p><a class="btn" href="?file=eicar">Unduh EICAR</a></p>
 <?php }else{ ?><p>Informasi layanan administrasi, surat menyurat, dan dokumen publik. Seluruh informasi bersifat fiktif.</p><?php } ?></section><?php } ?></main><footer>Portal dummy untuk pengujian NGFW • Local lab only</footer></body></html>
 PHP
