@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 022
 trap 'echo "[ERROR] Installation stopped at line $LINENO" >&2' ERR
-IP=192.168.36.72
+IP=${LAB_IP:-192.168.36.72}
 DOMAIN=portal.kementrian.co.id
 BASE=/opt/ngfw-portal
 . /etc/os-release
@@ -47,25 +47,29 @@ php-fpm5.6 -t
 systemctl restart php5.6-fpm
 cat > nginx.conf <<'NGINX'
 server {
-    listen 192.168.36.72:80;
-    listen 192.168.36.72:443 ssl;
+    listen LAB_BIND_IP:80;
+    listen LAB_BIND_IP:443 ssl;
     server_name portal.kementrian.co.id;
     ssl_certificate /opt/ngfw-portal/tls/cert.pem;
     ssl_certificate_key /opt/ngfw-portal/tls/key.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
     root /opt/ngfw-portal/web;
-    access_log /var/log/nginx/ngfw-portal-access.log;
+    access_log /var/log/nginx/access.log;
     error_log /var/log/nginx/ngfw-portal-error.log;
     index index.php;
     client_max_body_size 2m;
     add_header X-Training-Lab NGFW-local-only always;
     location / { try_files $uri $uri/ =404; }
-    location = /upload.php { include fastcgi_params; fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name; fastcgi_pass unix:/run/php/ngfw-portal.sock; }
-    location ~ \.php$ { try_files $uri =404; include fastcgi_params; fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name; fastcgi_pass unix:/run/php/ngfw-portal.sock; }
+    location ~ \.php$ {
+        try_files $uri =404;
+        include fastcgi.conf;
+        fastcgi_pass unix:/run/php/ngfw-portal.sock;
+    }
     location ~ /\. { deny all; }
 }
 NGINX
-if [[ ! -s tls/key.pem || ! -s tls/cert.pem ]]; then
+sed -i "s/LAB_BIND_IP/$IP/g" nginx.conf
+if [[ ! -s tls/key.pem || ! -s tls/cert.pem ]] || ! openssl x509 -in tls/cert.pem -noout -checkip "$IP" | grep -q "does match"; then
  openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj "/CN=$DOMAIN" -addext "subjectAltName=DNS:$DOMAIN,IP:$IP" -keyout tls/key.pem -out tls/cert.pem
 fi
 chmod 600 tls/key.pem
@@ -123,8 +127,14 @@ fi
 chown -R root:root "$BASE/web"
 find "$BASE/web" -type f -exec chmod 644 {} +
 nginx -t
+if nginx -T 2>&1 | grep -i 'conflicting server name' | grep -F "$DOMAIN"; then
+  echo '[ERROR] Duplicate portal virtual host. Disable the conflicting site before continuing.' >&2
+  exit 1
+fi
 systemctl enable --now nginx
-systemctl reload nginx
+systemctl restart nginx
+echo "[CHECK] Target HTTP: $DOMAIN -> $IP"
+ss -ltn | grep -E ":(80|443)[[:space:]]" || true
 echo '[CHECK] Validasi seluruh service dan endpoint'
 for service in nginx php5.6-fpm ssh vsftpd; do
   systemctl is-active --quiet "$service"
@@ -132,13 +142,20 @@ for service in nginx php5.6-fpm ssh vsftpd; do
 done
 for page in index login search pengaduan upload download layanan; do
   php5.6 -l "$BASE/web/$page.php" >/dev/null
-  curl --noproxy '*' --max-time 15 --fail --silent --show-error --resolve "$DOMAIN:80:$IP" "http://$DOMAIN/$page.php" >/dev/null
+  if ! curl --noproxy '*' --max-time 15 --fail --silent --show-error --resolve "$DOMAIN:80:$IP" "http://$DOMAIN/$page.php" >/dev/null; then
+    echo "[ERROR] HTTP /$page.php failed. Diagnostic information:"
+    ls -ld "$BASE" "$BASE/web" "$BASE/web/$page.php"
+    curl --noproxy '*' -si --max-time 10 --resolve "$DOMAIN:80:$IP" "http://$DOMAIN/$page.php" | head -c 2000 || true
+    nginx -T 2>&1 | grep -E 'configuration file|server_name|listen |root |fastcgi_pass' || true
+    tail -n 20 /var/log/nginx/ngfw-portal-error.log || true
+    exit 1
+  fi
   printf '[OK] HTTP /%s.php\n' "$page"
 done
 curl --noproxy '*' --max-time 15 --fail --silent --show-error --cacert "$BASE/tls/cert.pem" --resolve "$DOMAIN:443:$IP" "https://$DOMAIN/" >/dev/null
 printf '[OK] HTTPS\n'
 ss -ltn
 
-printf '\nPortal: http://%s / https://%s\nLogs: tail -f /var/log/nginx/ngfw-portal-access.log\n' "$DOMAIN" "$DOMAIN"
+printf '\nPortal: http://%s / https://%s\nLogs: tail -f /var/log/nginx/access.log\n' "$DOMAIN" "$DOMAIN"
 php-fpm5.6 -v
 
